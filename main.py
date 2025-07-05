@@ -1,158 +1,143 @@
 import numpy as np
 
-##### TODO #########################################
-### IMPLEMENT 'getMyPosition' FUNCTION #############
-### TO RUN, RUN 'eval.py' ##########################
+##### MOMENTUM + MEAN REVERSION + BREAKOUT + VOLATILITY SIZING - VERSION 5 #####
+### Added volatility-based position sizing for better risk management ###
 
 nInst = 50
 currentPos = np.zeros(nInst)
 
-# Advanced strategy parameters based on professional research
-LOOKBACK_DAYS = 20  # Shorter for more responsive signals
-TREND_LOOKBACK = 100  # Long-term trend identification
-MAX_POSITION_PCT = 0.4  # Conservative position sizing for better risk-adjusted returns
-VOLATILITY_THRESHOLD = 0.012  # Even stricter volatility filter
-ENTRY_THRESHOLD = 2.5  # Higher threshold for ultra-selective entry
-EXIT_THRESHOLD = 0.8  # Quicker exits as recommended by research
-MIN_PRICE = 10.0  # Higher quality stocks only
-MAX_HOLDING_DAYS = 5  # Maximum holding period as per research
-RSI_OVERSOLD = 20  # RSI-based mean reversion levels
-RSI_OVERBOUGHT = 80
+# Strategy parameters
+MOMENTUM_DAYS = 50  # Momentum lookback period
+MEAN_REVERT_DAYS = 5  # Short-term mean reversion period  
+VOLATILITY_DAYS = 10  # Volatility calculation period
+BREAKOUT_DAYS = 25  # Breakout lookback period
+BASE_POSITION_SIZE = 1.15  # Base position size (increased slightly)
+MIN_PRICE = 1.0  # Avoid penny stocks
+MAX_VOLATILITY = 0.225  # Tighter volatility filter
+TARGET_VOLATILITY = 0.02  # Target volatility for position sizing
+MOMENTUM_THRESHOLD = 0.02  # 2% momentum threshold
+MEAN_REVERT_THRESHOLD = 0.0350  # 1.5% mean reversion threshold
+BREAKOUT_THRESHOLD = 0.00005  # 0.5% above/below recent high/low
 
-# Position tracking for holding period management
-position_entry_day = np.full(nInst, -1)
-global_day_counter = 0
 
-def calculate_rsi(prices, period=2):
-    """Calculate 2-period RSI as recommended in research"""
-    if len(prices) < period + 1:
-        return 50.0
+def calculate_volatility(prices, days=10):
+    """Calculate daily volatility over specified period"""
+    if len(prices) < days + 1:
+        return 0.05  # Default to high volatility if not enough data
     
-    deltas = np.diff(prices)
-    gains = np.where(deltas > 0, deltas, 0)
-    losses = np.where(deltas < 0, -deltas, 0)
-    
-    avg_gain = np.mean(gains[-period:]) if len(gains) >= period else 0
-    avg_loss = np.mean(losses[-period:]) if len(losses) >= period else 0
-    
-    if avg_loss == 0:
-        return 100.0
-    
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    # Calculate daily returns
+    returns = np.diff(prices[-days-1:]) / prices[-days-1:-1]
+    return np.std(returns)
 
-def identify_trend(prices, short_period=20, long_period=100):
-    """Identify primary trend direction using dual moving averages"""
-    if len(prices) < long_period:
-        return 0  # Neutral
+def calculate_volatility_adjusted_size(base_size, volatility, target_vol=0.02):
+    """Calculate position size adjusted for volatility"""
+    if volatility <= 0:
+        return base_size
     
-    short_ma = np.mean(prices[-short_period:])
-    long_ma = np.mean(prices[-long_period:])
+    # Size inversely to volatility: lower vol = larger position, higher vol = smaller position
+    vol_ratio = target_vol / volatility
+    # Cap the adjustment between 0.3x and 2.0x to avoid extreme positions
+    vol_ratio = np.clip(vol_ratio, 0.3, 2.0)
     
-    if short_ma > long_ma * 1.02:  # 2% buffer for strong uptrend
-        return 1
-    elif short_ma < long_ma * 0.98:  # 2% buffer for strong downtrend
-        return -1
-    else:
-        return 0  # Sideways/unclear trend
+    return base_size * vol_ratio
+
+def calculate_mean_reversion_signal(prices, days=5):
+    """Calculate mean reversion signal - recent price vs short-term average"""
+    if len(prices) < days + 1:
+        return 0.0
+    
+    recent_avg = np.mean(prices[-days-1:-1])  # Average of last N days (excluding today)
+    current_price = prices[-1]
+    
+    # Negative signal means price is below average (buy signal)
+    # Positive signal means price is above average (sell signal)
+    return (current_price - recent_avg) / recent_avg
+
+def calculate_breakout_signal(prices, days=20):
+    """Calculate breakout signal - current price vs recent high/low"""
+    if len(prices) < days + 1:
+        return 0.0
+    
+    # Get recent high and low (excluding today)
+    recent_high = np.max(prices[-days-1:-1])
+    recent_low = np.min(prices[-days-1:-1])
+    current_price = prices[-1]
+    
+    # Check for breakout above recent high
+    if current_price > recent_high * (1 + BREAKOUT_THRESHOLD):
+        return 1.0  # Bullish breakout
+    
+    # Check for breakdown below recent low
+    elif current_price < recent_low * (1 - BREAKOUT_THRESHOLD):
+        return -1.0  # Bearish breakout
+    
+    return 0.0  # No breakout
 
 def getMyPosition(prcSoFar):
-    global currentPos, position_entry_day, global_day_counter
+    global currentPos
     (nins, nt) = prcSoFar.shape
-    global_day_counter = nt
     
-    # Need sufficient history for all calculations
-    if nt < TREND_LOOKBACK + 10:
+    # Need enough history for all calculations
+    if nt < max(MOMENTUM_DAYS, MEAN_REVERT_DAYS, VOLATILITY_DAYS, BREAKOUT_DAYS) + 1:
         return np.zeros(nins)
     
-    # Calculate current prices and position limits
     currentPrices = prcSoFar[:, -1]
     posLimits = np.array([int(x) for x in 10000 / np.maximum(currentPrices, MIN_PRICE)])
     
-    # New position array
     newPos = np.zeros(nins)
     
     for i in range(nins):
         # Skip low-quality stocks
         if currentPrices[i] < MIN_PRICE:
-            newPos[i] = 0
-            position_entry_day[i] = -1
-            continue
-            
-        # Get price history for this instrument
-        price_history = prcSoFar[i, :]
-        
-        # Calculate trend direction
-        trend = identify_trend(price_history)
-        
-        # Skip if no clear trend (reduces trading frequency and costs)
-        if trend == 0:
-            # Gradually exit positions in unclear trends
-            newPos[i] = int(currentPos[i] * 0.5)
             continue
         
-        # Calculate volatility over recent period
-        if nt >= LOOKBACK_DAYS + 1:
-            returns = np.log(price_history[-LOOKBACK_DAYS:] / price_history[-LOOKBACK_DAYS-1:-1])
-            volatility = np.std(returns)
-        else:
-            volatility = 0.02  # Default to high volatility
+        # Calculate volatility for filtering AND position sizing
+        volatility = calculate_volatility(prcSoFar[i, :], VOLATILITY_DAYS)
+        if volatility > MAX_VOLATILITY:
+            continue  # Skip volatile stocks
             
-        # Skip volatile instruments
-        if volatility > VOLATILITY_THRESHOLD:
-            newPos[i] = int(currentPos[i] * 0.7)  # Gradual exit
-            continue
-            
-        # Calculate mean reversion signals
-        mean_returns = np.mean(returns) if nt >= LOOKBACK_DAYS + 1 else 0
-        current_return = np.log(currentPrices[i] / prcSoFar[i, -2])
+        # Calculate volatility-adjusted position size
+        adjusted_position_size = calculate_volatility_adjusted_size(
+            BASE_POSITION_SIZE, volatility, TARGET_VOLATILITY
+        )
         
-        # Z-score for mean reversion
-        z_score = (current_return - mean_returns) / volatility if volatility > 0 else 0
+        # Calculate all signals
+        price_now = currentPrices[i]
+        price_past = prcSoFar[i, -MOMENTUM_DAYS-1]
+        momentum = (price_now - price_past) / price_past
         
-        # Calculate RSI for additional confirmation
-        rsi = calculate_rsi(price_history[-10:]) if len(price_history) >= 10 else 50
+        mean_revert_signal = calculate_mean_reversion_signal(prcSoFar[i, :], MEAN_REVERT_DAYS)
+        breakout_signal = calculate_breakout_signal(prcSoFar[i, :], BREAKOUT_DAYS)
         
-        # Check if we should exit due to holding period
-        if position_entry_day[i] >= 0 and (global_day_counter - position_entry_day[i]) >= MAX_HOLDING_DAYS:
-            newPos[i] = 0  # Force exit after max holding period
-            position_entry_day[i] = -1
-            continue
-            
-        # PROFESSIONAL MEAN REVERSION LOGIC (trend-aligned)
-        current_position = currentPos[i]
+        # Multi-signal strategy with priority system
+        signal_strength = 0.0
         
-        if trend == 1:  # UPTREND - Look for dips to buy
-            if (z_score < -ENTRY_THRESHOLD and rsi < RSI_OVERSOLD and current_position == 0):
-                # Strong oversold signal in uptrend - BUY
-                signal_strength = min(1.0, abs(z_score) / 4.0)
-                newPos[i] = int(MAX_POSITION_PCT * posLimits[i] * signal_strength)
-                position_entry_day[i] = global_day_counter
-            elif current_position > 0 and (z_score > -EXIT_THRESHOLD or rsi > 70):
-                # Exit long position - price has reverted or become overbought
-                newPos[i] = 0
-                position_entry_day[i] = -1
-            else:
-                newPos[i] = current_position  # Hold
-                
-        elif trend == -1:  # DOWNTREND - Look for rallies to short
-            if (z_score > ENTRY_THRESHOLD and rsi > RSI_OVERBOUGHT and current_position == 0):
-                # Strong overbought signal in downtrend - SHORT
-                signal_strength = min(1.0, abs(z_score) / 4.0)
-                newPos[i] = -int(MAX_POSITION_PCT * posLimits[i] * signal_strength)
-                position_entry_day[i] = global_day_counter
-            elif current_position < 0 and (z_score < EXIT_THRESHOLD or rsi < 30):
-                # Exit short position - price has reverted or become oversold
-                newPos[i] = 0
-                position_entry_day[i] = -1
-            else:
-                newPos[i] = current_position  # Hold
+        # Priority 1: Breakout signals (strongest - catch big moves early)
+        if breakout_signal != 0:
+            signal_strength = breakout_signal * 1.2  # Amplify breakout signals
         
-        # Apply position limits
-        newPos[i] = np.clip(newPos[i], -posLimits[i], posLimits[i])
+        # Priority 2: Strong momentum signals (trend-following)
+        elif momentum > MOMENTUM_THRESHOLD:
+            signal_strength = 1.0  # Buy on strong uptrend
+        elif momentum < -MOMENTUM_THRESHOLD:
+            signal_strength = -1.0  # Sell on strong downtrend
+        
+        # Priority 3: Mean reversion signals (contrarian) - only when momentum is weak
+        elif abs(momentum) < MOMENTUM_THRESHOLD * 0.5:  # Weak momentum
+            if mean_revert_signal < -MEAN_REVERT_THRESHOLD:
+                signal_strength = 0.8  # Buy dip (price below recent average)
+            elif mean_revert_signal > MEAN_REVERT_THRESHOLD:
+                signal_strength = -0.8  # Sell rally (price above recent average)
+        
+        # Apply volatility-adjusted position sizing
+        if signal_strength != 0:
+            position = int(adjusted_position_size * posLimits[i] * signal_strength)
+            newPos[i] = position
     
-    # Update global position tracking
+    # Apply position limits
+    newPos = np.clip(newPos, -posLimits, posLimits)
+    
+    # Update tracking
     currentPos = newPos.copy()
     
-    return newPos
+    return newPos.astype(int)
